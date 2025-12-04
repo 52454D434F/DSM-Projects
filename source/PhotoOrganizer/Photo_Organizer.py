@@ -8,22 +8,30 @@ import sys
 import subprocess
 import signal
 import atexit
+import json
 from datetime import datetime
 from PIL import Image
 from PIL.ExifTags import TAGS
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
+# File locking support (Unix/Linux only)
+try:
+    import fcntl
+    HAS_FCNTL = True
+except ImportError:
+    HAS_FCNTL = False
+
 # Optional dependency: mutagen for video metadata extraction
 try:
     import mutagen
     from mutagen.mp4 import MP4
-    from mutagen.quicktime import QuickTime
+    # Note: QuickTime module doesn't exist in mutagen 1.47.0+
+    # MOV files are handled by MP4 module since they share the same container format
     MUTAGEN_AVAILABLE = True
 except ImportError:
     mutagen = None
     MP4 = None
-    QuickTime = None
     MUTAGEN_AVAILABLE = False
 
 def get_package_version():
@@ -118,6 +126,10 @@ def load_runtime_config():
             break  # Successfully loaded a config, no need to try other paths
         except Exception as e:
             print(f"Warning: Error reading config file {path}: {e}")
+    
+    # Initialize statistics file path and load statistics after DEST_DIR is set
+    initialize_statistics_file()
+    load_statistics()
 
 # Ensure DEST_DIR exists
 if not os.path.exists(DEST_DIR):
@@ -126,17 +138,135 @@ if not os.path.exists(DEST_DIR):
     except Exception as e:
         print(f"Warning: Could not create destination directory {DEST_DIR}: {e}")
 
+def initialize_statistics_file():
+    """Initialize the statistics file path after DEST_DIR is set."""
+    global STATS_FILE
+    STATS_FILE = os.path.join(DEST_DIR, "Photo_Organizer_Statistics.json")
+    STATS_FILE = os.path.abspath(STATS_FILE)
+
+def load_statistics():
+    """Load statistics from JSON file."""
+    global stats
+    if STATS_FILE is None:
+        initialize_statistics_file()
+    
+    if os.path.exists(STATS_FILE):
+        try:
+            with open(STATS_FILE, 'r', encoding='utf-8') as f:
+                # Use file locking on Unix/Linux if available
+                if HAS_FCNTL:
+                    try:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                    except (IOError, OSError):
+                        pass  # Locking failed, continue without lock
+                
+                loaded_stats = json.load(f)
+                
+                if HAS_FCNTL:
+                    try:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    except (IOError, OSError):
+                        pass
+                
+                # Merge with defaults (in case new fields were added)
+                for key in stats:
+                    if key in loaded_stats:
+                        if key == "last_updated":
+                            stats[key] = loaded_stats[key]
+                        else:
+                            # Ensure numeric values
+                            try:
+                                stats[key] = int(loaded_stats[key])
+                            except (ValueError, TypeError):
+                                stats[key] = 0
+        except Exception as e:
+            log_system_event("Warning", f"Error loading statistics: {e}")
+
+def save_statistics(force=False):
+    """Save statistics to JSON file with file locking.
+    
+    Args:
+        force: If True, save immediately regardless of counter
+    """
+    global stats, _stats_save_counter
+    if STATS_FILE is None:
+        initialize_statistics_file()
+    
+    stats["last_updated"] = datetime.now().isoformat()
+    
+    try:
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
+        
+        # Write with file locking
+        with open(STATS_FILE, 'w', encoding='utf-8') as f:
+            if HAS_FCNTL:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                except (IOError, OSError):
+                    pass  # Locking failed, continue without lock
+            
+            json.dump(stats, f, indent=2)
+            
+            if HAS_FCNTL:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except (IOError, OSError):
+                    pass
+        
+        # Reset counter if forced save
+        if force:
+            _stats_save_counter = 0
+    except Exception as e:
+        log_system_event("Error", f"Error saving statistics: {e}")
+
+def save_statistics_if_needed(force=False):
+    """Save statistics periodically (every 10 operations or 30 seconds timeout) or when forced."""
+    global _stats_save_counter, _stats_last_save_time
+    
+    _stats_save_counter += 1
+    current_time = time.time()
+    
+    # Initialize last save time if not set
+    if _stats_last_save_time is None:
+        _stats_last_save_time = current_time
+    
+    # Save every 10 operations, after 30 seconds timeout, or when forced
+    time_since_last_save = current_time - _stats_last_save_time
+    if force or _stats_save_counter >= 10 or time_since_last_save >= 30:
+        save_statistics()
+        _stats_save_counter = 0
+        _stats_last_save_time = current_time
+
 # Log file path - stored in DEST_DIR
-LOG_FILE = os.path.join(DEST_DIR, "Photo_Organizer.log")
+LOG_FILE = os.path.join(DEST_DIR, "Photo_Organizer_Activities.log")
 LOG_FILE = os.path.abspath(LOG_FILE)
 LOG_FILE_INITIALIZED = False
 
 # System log file path - stored in DEST_DIR
-SYSTEM_LOG_FILE = os.path.join(DEST_DIR, "System.log")
+SYSTEM_LOG_FILE = os.path.join(DEST_DIR, "Photo_Organizer_Application.log")
 SYSTEM_LOG_FILE = os.path.abspath(SYSTEM_LOG_FILE)
 SYSTEM_LOG_INITIALIZED = False
 
-# Statistics tracking
+# Statistics file path - stored in DEST_DIR (will be set after config loads)
+STATS_FILE = None
+
+# Statistics tracking - detailed counters
+stats = {
+    "files_moved_to_destination": 0,
+    "bytes_moved_to_destination": 0,
+    "files_moved_to_duplicates": 0,
+    "bytes_moved_to_duplicates": 0,
+    "files_deleted": 0,
+    "bytes_deleted": 0,
+    "last_updated": None
+}
+
+# Counter for batch saving (save every 10 operations)
+_stats_save_counter = 0
+_stats_last_save_time = None
+
+# Legacy variables for backward compatibility with existing log_statistics function
 bytes_moved = 0
 bytes_deleted = 0
 last_file_detected_time = None
@@ -215,12 +345,17 @@ def test_dependencies():
         log_system_event("Warning", "Dependency check: imagehash (optional) is not installed")
     
     # Test mutagen (optional, for video file metadata)
-    if MUTAGEN_AVAILABLE:
+    # Try importing mutagen directly to check if it's available
+    try:
+        import mutagen
+        from mutagen.mp4 import MP4
+        # Note: QuickTime module doesn't exist in mutagen 1.47.0+, MOV files use MP4
         print("✓ mutagen (optional, for video metadata)")
         installed_deps.append("mutagen")
-    else:
+    except ImportError:
         print("⚠ mutagen is NOT installed (optional, for video metadata)")
         print("  Install with: pip install mutagen")
+        print("  Or install all dependencies: pip install -r requirements.txt")
         print("  Note: Video files will use file creation/modification date if mutagen is not installed")
         warnings.append("mutagen (optional)")
         log_system_event("Warning", "Dependency check: mutagen (optional) is not installed - video files will use file date")
@@ -233,7 +368,8 @@ def test_dependencies():
             print(f"  - {dep}")
         print()
         print("Install missing packages with:")
-        print("  pip install Pillow watchdog imagehash")
+        print("  pip install -r requirements.txt")
+        print("  Or individually: pip install Pillow watchdog imagehash mutagen")
         print()
         log_system_event("Error", f"Dependency check completed: Missing required dependencies - {', '.join(missing_deps)}")
         return False
@@ -329,14 +465,12 @@ def log_statistics(reason="service stopped", force=False):
     if not force and statistics_already_logged and reason == "service stopped":
         return
     
-    # Use current statistics
-    total_moved = bytes_moved
-    total_deleted = bytes_deleted
+    # Save statistics before logging (force save)
+    save_statistics(force=True)
     
-    moved_formatted = format_bytes(total_moved)
-    deleted_formatted = format_bytes(total_deleted)
+    # Statistics are saved to Photo_Organizer_Statistics.json
+    # No longer logging detailed statistics to application log
     
-    log_system_event("Info", f"Statistics ({reason}): {moved_formatted} moved, {deleted_formatted} deleted")
     last_statistics_log_time = time.time()
     
     # Mark as logged if this is an exit-related log
@@ -372,7 +506,7 @@ def log_system_event(level, event_message):
         print(f"Error writing to system log file: {e}")
 
 def log_file_event(event_type, file_path, dest_path=None, file_size=None, additional_info=""):
-    """Log file event to Photo_Organizer.log.
+    """Log file event to Photo_Organizer_Activities.log.
     
     Columns: Time, IP address, User, File name, File size, Event, Additional Info, File/Folder
     Saves to log file and prints to console.
@@ -509,8 +643,19 @@ def get_video_taken_date(video_path):
                         pass
             
             elif file_ext == '.mov':
-                mov_file = QuickTime(video_path)
-                # Try to get creation date from QuickTime metadata
+                # MOV files use the same container format as MP4, so use MP4 module
+                mov_file = MP4(video_path)
+                # Try to get creation date from MOV metadata (same tags as MP4)
+                if '©day' in mov_file:
+                    date_str = mov_file['©day'][0]
+                    try:
+                        if 'T' in date_str:
+                            return datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%S')
+                        else:
+                            return datetime.strptime(date_str, '%Y-%m-%d')
+                    except ValueError:
+                        pass
+                # Try creation date tag (alternative)
                 if '\xa9day' in mov_file:
                     date_str = mov_file['\xa9day'][0]
                     try:
@@ -839,7 +984,10 @@ def process_photo(file_path):
                             if DELETE_DUPLICATES:
                                 os.remove(file_path)
                                 log_file_event("Duplicate Deleted", file_path, None, file_size, "Unknown file type - exact duplicate detected and deleted")
-                                bytes_deleted += file_size
+                                stats["files_deleted"] += 1
+                                stats["bytes_deleted"] += file_size
+                                bytes_deleted += file_size  # Legacy compatibility
+                                save_statistics_if_needed()
                                 update_synology_indexer(old_path=file_path, new_path=None)
                             else:
                                 # Keep duplicate with unique name
@@ -849,7 +997,10 @@ def process_photo(file_path):
                                 duplicates_path = os.path.join(duplicates_folder, unique_name)
                                 shutil.move(file_path, duplicates_path)
                                 log_file_event("Moved to Duplicates", file_path, duplicates_path, file_size, "Unknown file type - exact duplicate detected (kept, not deleted)")
-                                bytes_moved += file_size
+                                stats["files_moved_to_duplicates"] += 1
+                                stats["bytes_moved_to_duplicates"] += file_size
+                                bytes_moved += file_size  # Legacy compatibility
+                                save_statistics_if_needed()
                                 update_synology_indexer(old_path=file_path, new_path=duplicates_path)
                             return
             except Exception:
@@ -860,7 +1011,10 @@ def process_photo(file_path):
             file_size = os.path.getsize(file_path)
             shutil.move(file_path, dest_path)
             log_file_event("File moved", file_path, dest_path, file_size, f"Unknown file type moved to Unknown File Types folder")
-            bytes_moved += file_size
+            stats["files_moved_to_destination"] += 1
+            stats["bytes_moved_to_destination"] += file_size
+            bytes_moved += file_size  # Legacy compatibility
+            save_statistics_if_needed()
             update_synology_indexer(old_path=file_path, new_path=dest_path)
         except Exception as e:
             log_file_event("Error", file_path, dest_path, None, f"Error moving unknown file type: {e}")
@@ -925,7 +1079,10 @@ def process_photo(file_path):
                     os.remove(file_path)
                     log_file_event("Duplicate Deleted", file_path, None, file_size, "Exact duplicate detected and deleted")
                     # Update statistics
-                    bytes_deleted += file_size
+                    stats["files_deleted"] += 1
+                    stats["bytes_deleted"] += file_size
+                    bytes_deleted += file_size  # Legacy compatibility
+                    save_statistics_if_needed()
                     # Update Synology indexer (remove deleted file from index)
                     update_synology_indexer(old_path=file_path, new_path=None)
                 else:
@@ -938,8 +1095,11 @@ def process_photo(file_path):
 
                     shutil.move(file_path, duplicates_path)
                     log_file_event("Moved to Duplicates", file_path, duplicates_path, file_size, "Exact duplicate detected (kept, not deleted)")
-                    # Count as moved data
-                    bytes_moved += file_size
+                    # Update statistics
+                    stats["files_moved_to_duplicates"] += 1
+                    stats["bytes_moved_to_duplicates"] += file_size
+                    bytes_moved += file_size  # Legacy compatibility
+                    save_statistics_if_needed()
                     # Update Synology indexer to reflect new location
                     update_synology_indexer(old_path=file_path, new_path=duplicates_path)
 
@@ -982,7 +1142,16 @@ def process_photo(file_path):
                     os.remove(file_to_move)
                     log_file_event("Duplicate Deleted", file_to_move, None, file_size, f"Exact duplicate already exists in Duplicates folder: {os.path.basename(existing_duplicate)}")
                     # Update statistics
-                    bytes_deleted += file_size
+                    # If deleting from destination, subtract from destination stats
+                    if file_to_move == dest_path:
+                        stats["files_moved_to_destination"] = max(0, stats["files_moved_to_destination"] - 1)
+                        stats["bytes_moved_to_destination"] = max(0, stats["bytes_moved_to_destination"] - file_size)
+                        bytes_moved = max(0, bytes_moved - file_size)  # Legacy compatibility
+                    # Add to deleted stats
+                    stats["files_deleted"] += 1
+                    stats["bytes_deleted"] += file_size
+                    bytes_deleted += file_size  # Legacy compatibility
+                    save_statistics_if_needed()
                     # Update Synology indexer (remove deleted file from index)
                     update_synology_indexer(old_path=file_to_move, new_path=None)
                 except Exception as e:
@@ -995,7 +1164,10 @@ def process_photo(file_path):
                         shutil.move(file_path, dest_path)
                         log_file_event("File moved", file_path, dest_path, file_size, "Replaced existing file with current file (is older)")
                         # Update statistics
-                        bytes_moved += file_size
+                        stats["files_moved_to_destination"] += 1
+                        stats["bytes_moved_to_destination"] += file_size
+                        bytes_moved += file_size  # Legacy compatibility
+                        save_statistics_if_needed()
                         # Update Synology indexer
                         update_synology_indexer(old_path=file_path, new_path=dest_path)
                     except Exception as e:
@@ -1010,7 +1182,17 @@ def process_photo(file_path):
                 file_size = os.path.getsize(file_to_move)
                 shutil.move(file_to_move, duplicates_path)
                 log_file_event("Moved to Duplicates", file_to_move, duplicates_path, file_size, f"Different content - {event_info}")
-                # Note: Files moved to Duplicates are excluded from statistics
+                # Update statistics
+                # If moving from destination to duplicates, adjust destination stats
+                if file_to_move == dest_path:
+                    # File was previously in destination, subtract from destination stats
+                    stats["files_moved_to_destination"] = max(0, stats["files_moved_to_destination"] - 1)
+                    stats["bytes_moved_to_destination"] = max(0, stats["bytes_moved_to_destination"] - file_size)
+                    bytes_moved = max(0, bytes_moved - file_size)  # Legacy compatibility
+                # Add to duplicates stats
+                stats["files_moved_to_duplicates"] += 1
+                stats["bytes_moved_to_duplicates"] += file_size
+                save_statistics_if_needed()
                 # Update Synology indexer
                 update_synology_indexer(old_path=file_to_move, new_path=duplicates_path)
                 
@@ -1021,7 +1203,10 @@ def process_photo(file_path):
                         shutil.move(file_path, dest_path)
                         log_file_event("File moved", file_path, dest_path, file_size, "Replaced existing file with the oldest file")
                         # Update statistics
-                        bytes_moved += file_size
+                        stats["files_moved_to_destination"] += 1
+                        stats["bytes_moved_to_destination"] += file_size
+                        bytes_moved += file_size  # Legacy compatibility
+                        save_statistics_if_needed()
                         # Update Synology indexer
                         update_synology_indexer(old_path=file_path, new_path=dest_path)
                     except Exception as e:
@@ -1042,7 +1227,10 @@ def process_photo(file_path):
         else:
             log_file_event("File moved", file_path, dest_path, file_size, "No date found keeping original name")
         # Update statistics
-        bytes_moved += file_size
+        stats["files_moved_to_destination"] += 1
+        stats["bytes_moved_to_destination"] += file_size
+        bytes_moved += file_size  # Legacy compatibility
+        save_statistics_if_needed()
         # Update Synology indexer
         update_synology_indexer(old_path=file_path, new_path=dest_path)
     except FileNotFoundError:
@@ -1175,9 +1363,15 @@ def start_watching():
                 if time_since_last_file >= 60 and statistics_reset_time is None:
                     global bytes_moved, bytes_deleted
                     # Log statistics before resetting (if there are any to log)
-                    if bytes_moved > 0 or bytes_deleted > 0:
+                    # Check if there are any statistics to log
+                    has_stats = (stats["files_moved_to_destination"] > 0 or 
+                                stats["files_moved_to_duplicates"] > 0 or 
+                                stats["files_deleted"] > 0 or
+                                bytes_moved > 0 or bytes_deleted > 0)
+                    if has_stats:
                         log_statistics("timeout", force=True)
-                    # Reset statistics to 0
+                    # Note: We don't reset the persistent statistics (stats dict) as those
+                    # are cumulative. Only reset the session-based bytes_moved/bytes_deleted
                     bytes_moved = 0
                     bytes_deleted = 0
                     statistics_reset_time = current_time
@@ -1195,6 +1389,8 @@ if __name__ == "__main__":
     def exit_handler():
         global statistics_already_logged
         if not statistics_already_logged:
+            # Force save statistics before logging
+            save_statistics(force=True)
             log_statistics()
     atexit.register(exit_handler)
     
@@ -1202,6 +1398,8 @@ if __name__ == "__main__":
     def signal_handler(signum, frame):
         print("\nReceived interrupt signal, logging statistics...")
         try:
+            # Force save statistics before logging
+            save_statistics(force=True)
             log_statistics()
             log_system_event("Info", "Photo Organizer service stopped by signal")
         except Exception as e:
