@@ -5,6 +5,34 @@ All notable changes to the Photo Organizer and Deduplicator project will be docu
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1-00019] - 2025-12-04
+
+### Fixed
+- **Critical Statistics Tracking Bug (CRITICAL FIX)**
+  - Fixed bug where files were successfully moved but statistics were not updated if logging operations failed
+  - Statistics are now updated immediately after `shutil.move()` succeeds, before any logging or indexer operations
+  - This ensures all file moves are accurately counted even if logging or Synology indexer updates fail
+  - **Impact**: Statistics now correctly reflect all files moved, preventing undercounting of processed files
+  - **Root Cause**: Exception handling was catching errors from logging/indexer operations, but file was already moved
+  - **Solution**: Statistics update moved to execute immediately after successful file move, with separate error handling for non-critical operations (logging, indexer updates)
+
+### Changed
+- **Statistics Update Order**
+  - Statistics are now updated immediately after file move operations complete
+  - Logging and indexer updates are wrapped in separate try-except blocks
+  - Non-critical operation failures (logging, indexer) no longer prevent statistics updates
+  - Ensures data integrity: if a file is moved, it's always counted in statistics
+
+### Technical Details
+- Applied fix to all file move operations:
+  - Main file move operation (normal date-based organization)
+  - Unknown file types move operation
+  - File replacement operations (when replacing existing files)
+- Statistics update is now atomic with file move operation
+- Logging failures are logged separately but don't affect statistics accuracy
+
+---
+
 ## [1.0.1-00018] - 2025-01-XX
 
 ### Added

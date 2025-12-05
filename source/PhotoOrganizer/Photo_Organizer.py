@@ -412,26 +412,54 @@ def format_file_size(size_bytes):
     return f"{size_bytes:.2f} PB"
 
 def initialize_log_file():
-    """Initialize the log file with header if it doesn't exist."""
+    """Initialize the log file with header if it doesn't exist or is empty."""
     global LOG_FILE_INITIALIZED
-    if not LOG_FILE_INITIALIZED and not os.path.exists(LOG_FILE):
-        try:
-            with open(LOG_FILE, 'w', encoding='utf-8') as f:
-                f.write("# Time, IP address, User, File name, File size, Event, Additional Info, File/Folder\n")
+    if not LOG_FILE_INITIALIZED:
+        # Check if file exists and has content
+        file_exists = os.path.exists(LOG_FILE)
+        file_has_content = False
+        if file_exists:
+            try:
+                file_has_content = os.path.getsize(LOG_FILE) > 0
+            except Exception:
+                file_has_content = False
+        
+        # Only initialize if file doesn't exist or is empty
+        if not file_exists or not file_has_content:
+            try:
+                with open(LOG_FILE, 'w', encoding='utf-8') as f:
+                    f.write("# Time, IP address, User, File name, File size, Event, Additional Info, File/Folder\n")
+                LOG_FILE_INITIALIZED = True
+            except Exception as e:
+                print(f"Error initializing log file: {e}")
+        else:
+            # File exists and has content - preserve it, just mark as initialized
             LOG_FILE_INITIALIZED = True
-        except Exception as e:
-            print(f"Error initializing log file: {e}")
 
 def initialize_system_log():
-    """Initialize the system log file with header if it doesn't exist."""
+    """Initialize the system log file with header if it doesn't exist or is empty."""
     global SYSTEM_LOG_INITIALIZED
-    if not SYSTEM_LOG_INITIALIZED and not os.path.exists(SYSTEM_LOG_FILE):
-        try:
-            with open(SYSTEM_LOG_FILE, 'w', encoding='utf-8') as f:
-                f.write("# Level, Log, Time, User, Event\n")
+    if not SYSTEM_LOG_INITIALIZED:
+        # Check if file exists and has content
+        file_exists = os.path.exists(SYSTEM_LOG_FILE)
+        file_has_content = False
+        if file_exists:
+            try:
+                file_has_content = os.path.getsize(SYSTEM_LOG_FILE) > 0
+            except Exception:
+                file_has_content = False
+        
+        # Only initialize if file doesn't exist or is empty
+        if not file_exists or not file_has_content:
+            try:
+                with open(SYSTEM_LOG_FILE, 'w', encoding='utf-8') as f:
+                    f.write("# Level, Log, Time, User, Event\n")
+                SYSTEM_LOG_INITIALIZED = True
+            except Exception as e:
+                print(f"Error initializing system log file: {e}")
+        else:
+            # File exists and has content - preserve it, just mark as initialized
             SYSTEM_LOG_INITIALIZED = True
-        except Exception as e:
-            print(f"Error initializing system log file: {e}")
 
 def format_bytes(bytes_value):
     """Format bytes into human-readable format (KB, MB, GB, etc.) with up to 2 decimal places."""
@@ -1080,14 +1108,28 @@ def process_photo(file_path):
         try:
             file_size = os.path.getsize(file_path)
             shutil.move(file_path, dest_path)
-            # Format destination path for log
-            dest_format = os.path.relpath(dest_path, DEST_DIR).replace(os.sep, '/')
-            log_file_event("File moved", file_path, dest_path, file_size, f"Unknown file type moved to {dest_format}")
+            # Update statistics IMMEDIATELY after move to ensure it's counted even if logging fails
             stats["files_moved_to_destination"] += 1
             stats["bytes_moved_to_destination"] += file_size
             bytes_moved += file_size  # Legacy compatibility
             save_statistics_if_needed()
-            update_synology_indexer(old_path=file_path, new_path=dest_path)
+            
+            # Format destination path for log
+            try:
+                dest_format = os.path.relpath(dest_path, DEST_DIR).replace(os.sep, '/')
+                log_file_event("File moved", file_path, dest_path, file_size, f"Unknown file type moved to {dest_format}")
+            except Exception as log_error:
+                # Logging failed, but file was moved and stats were updated
+                try:
+                    log_file_event("Error", file_path, dest_path, None, f"File moved successfully but logging failed: {log_error}")
+                except Exception:
+                    pass
+            
+            # Update Synology indexer (non-critical, can fail without affecting stats)
+            try:
+                update_synology_indexer(old_path=file_path, new_path=dest_path)
+            except Exception:
+                pass
         except Exception as e:
             log_file_event("Error", file_path, dest_path, None, f"Error moving unknown file type: {e}")
         return
@@ -1245,16 +1287,28 @@ def process_photo(file_path):
                     try:
                         file_size = os.path.getsize(file_path)
                         shutil.move(file_path, dest_path)
-                        # Format destination path for log
-                        dest_format = os.path.relpath(dest_path, DEST_DIR).replace(os.sep, '/')
-                        log_file_event("File moved", file_path, dest_path, file_size, f"Replaced existing {dest_format} file with current file (is older)")
-                        # Update statistics
+                        # Update statistics IMMEDIATELY after move to ensure it's counted even if logging fails
                         stats["files_moved_to_destination"] += 1
                         stats["bytes_moved_to_destination"] += file_size
                         bytes_moved += file_size  # Legacy compatibility
                         save_statistics_if_needed()
-                        # Update Synology indexer
-                        update_synology_indexer(old_path=file_path, new_path=dest_path)
+                        
+                        # Format destination path for log
+                        try:
+                            dest_format = os.path.relpath(dest_path, DEST_DIR).replace(os.sep, '/')
+                            log_file_event("File moved", file_path, dest_path, file_size, f"Replaced existing {dest_format} file with current file (is older)")
+                        except Exception as log_error:
+                            # Logging failed, but file was moved and stats were updated
+                            try:
+                                log_file_event("Error", file_path, dest_path, None, f"File moved successfully but logging failed: {log_error}")
+                            except Exception:
+                                pass
+                        
+                        # Update Synology indexer (non-critical, can fail without affecting stats)
+                        try:
+                            update_synology_indexer(old_path=file_path, new_path=dest_path)
+                        except Exception:
+                            pass
                     except Exception as e:
                         log_file_event("Error", file_path, dest_path, None, f"Error moving source to destination: {e}")
                 return
@@ -1288,16 +1342,28 @@ def process_photo(file_path):
                     try:
                         file_size = os.path.getsize(file_path)
                         shutil.move(file_path, dest_path)
-                        # Format destination path for log
-                        dest_format = os.path.relpath(dest_path, DEST_DIR).replace(os.sep, '/')
-                        log_file_event("File moved", file_path, dest_path, file_size, f"Replaced existing {dest_format} file with the oldest file")
-                        # Update statistics
+                        # Update statistics IMMEDIATELY after move to ensure it's counted even if logging fails
                         stats["files_moved_to_destination"] += 1
                         stats["bytes_moved_to_destination"] += file_size
                         bytes_moved += file_size  # Legacy compatibility
                         save_statistics_if_needed()
-                        # Update Synology indexer
-                        update_synology_indexer(old_path=file_path, new_path=dest_path)
+                        
+                        # Format destination path for log
+                        try:
+                            dest_format = os.path.relpath(dest_path, DEST_DIR).replace(os.sep, '/')
+                            log_file_event("File moved", file_path, dest_path, file_size, f"Replaced existing {dest_format} file with the oldest file")
+                        except Exception as log_error:
+                            # Logging failed, but file was moved and stats were updated
+                            try:
+                                log_file_event("Error", file_path, dest_path, None, f"File moved successfully but logging failed: {log_error}")
+                            except Exception:
+                                pass
+                        
+                        # Update Synology indexer (non-critical, can fail without affecting stats)
+                        try:
+                            update_synology_indexer(old_path=file_path, new_path=dest_path)
+                        except Exception:
+                            pass
                     except Exception as e:
                         log_file_event("Error", file_path, dest_path, None, f"Error moving source to destination: {e}")
             except Exception as e:
@@ -1311,19 +1377,31 @@ def process_photo(file_path):
         
         file_size = os.path.getsize(file_path)
         shutil.move(file_path, dest_path)
-        # Format destination path for log
-        dest_format = os.path.relpath(dest_path, DEST_DIR).replace(os.sep, '/')
-        if media_datetime:
-            log_file_event("File moved", file_path, dest_path, file_size, f"Renamed to {dest_filename} and moved to {dest_format}")
-        else:
-            log_file_event("File moved", file_path, dest_path, file_size, f"No date found keeping original name, moved to {dest_format}")
-        # Update statistics
+        # Update statistics IMMEDIATELY after move to ensure it's counted even if logging fails
         stats["files_moved_to_destination"] += 1
         stats["bytes_moved_to_destination"] += file_size
         bytes_moved += file_size  # Legacy compatibility
         save_statistics_if_needed()
-        # Update Synology indexer
-        update_synology_indexer(old_path=file_path, new_path=dest_path)
+        
+        # Format destination path for log
+        try:
+            dest_format = os.path.relpath(dest_path, DEST_DIR).replace(os.sep, '/')
+            if media_datetime:
+                log_file_event("File moved", file_path, dest_path, file_size, f"Renamed to {dest_filename} and moved to {dest_format}")
+            else:
+                log_file_event("File moved", file_path, dest_path, file_size, f"No date found keeping original name, moved to {dest_format}")
+        except Exception as log_error:
+            # Logging failed, but file was moved and stats were updated - log the logging error
+            try:
+                log_file_event("Error", file_path, dest_path, None, f"File moved successfully but logging failed: {log_error}")
+            except Exception:
+                pass  # If even error logging fails, continue silently
+        
+        # Update Synology indexer (non-critical, can fail without affecting stats)
+        try:
+            update_synology_indexer(old_path=file_path, new_path=dest_path)
+        except Exception:
+            pass  # Indexer update failed, but file was moved and stats were updated
     except FileNotFoundError:
         # File was already moved or deleted, ignore silently
         pass
