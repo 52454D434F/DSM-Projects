@@ -5,7 +5,7 @@ All notable changes to the Photo Organizer and Deduplicator project will be docu
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.1-00019] - 2025-12-04
+## [1.0.1-00019] - 2025-12-05
 
 ### Fixed
 - **Critical Statistics Tracking Bug (CRITICAL FIX)**
@@ -33,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [1.0.1-00018] - 2025-01-XX
+## [1.0.1-00018] - 2025-12-04
 
 ### Added
 - **CreateDate EXIF Tag Support**
